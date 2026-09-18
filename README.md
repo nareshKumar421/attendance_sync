@@ -91,21 +91,64 @@ Safe to re-run over any range. Punches carry a uniqueness constraint on
 
 ### Scheduling
 
-Task Scheduler, daily at 01:30:
+Twice a day, on two machines, and **the order between them is the whole thing**.
+The agent copies punches; the server turns them into the register. Roll up
+before the punches land and nothing errors -- the register simply marks the
+entire workforce absent, and payroll is run from that. It happened on
+18 Sep 2026: the roll-up ran at 16:19, the punches arrived at 16:25, and 249
+people read ABSENT until it was re-run.
 
-| Field | Value |
-|---|---|
-| Program | `C:\path\to\python.exe` |
-| Arguments | `attendance_sync.py --days 2` |
-| Start in | `C:\path\to\sync` |
+| | Plant Windows box | Application server |
+|---|---|---|
+| Runs | 12:45 and 23:15 | 13:00 and 23:30 |
+| What | `attendance_sync.py --days 2` | `manage.py sync_biometric_attendance --days 2` |
+| Via | `scheduling/run_attendance_sync.bat` | `rollup_attendance.sh` |
 
-**Set "Start in"**, or the script will not find `.env`.
+Fifteen minutes is the gap; 10,311 punches over 18 days took under two minutes
+to pull, so it is generous. `--days 2` on both sides, because the last punch-out
+of the night lands around 21:30 and a day that gets scored before it is final
+strands every night-shift worker on `MISSING_PUNCH`.
 
-The application server's own roll-up should run *after* this, around 02:30:
+**Plant box.** Copy the repo somewhere permanent, then either import the task:
+
+```bat
+schtasks /Create /TN "Attendance Sync" /XML scheduling\AttendanceSync.xml /RU ACCOUNT
+```
+
+(edit `<Command>` in the XML to the real path first), or create the two runs
+directly, which needs no file editing:
+
+```bat
+schtasks /Create /TN "Attendance Sync (midday)" /TR "C:\path\to\sync\scheduling\run_attendance_sync.bat" /SC DAILY /ST 12:45
+schtasks /Create /TN "Attendance Sync (night)"  /TR "C:\path\to\sync\scheduling\run_attendance_sync.bat" /SC DAILY /ST 23:15
+```
+
+The `.bat` sets its own working directory, so no "Start in" field to forget --
+which was worth removing, because without it the script finds no `.env`, fails
+on the first setting it reads, and looks identical to a night nobody punched.
+It logs to `logs\attendance_sync.log` and exits with the script's own code, so
+Task Scheduler's "Last Run Result" means something.
+
+**Application server.** `rollup_attendance.sh` lives at
+`/home/superadmin/django_projects/` and is in `superadmin`'s crontab:
 
 ```cron
-30 2 * * *  cd /path/to/factory_app && ./venv/bin/python manage.py sync_biometric_attendance --days 2 --quiet-progress
+0 13 * * * /home/superadmin/django_projects/rollup_attendance.sh >/dev/null 2>&1
+30 23 * * * /home/superadmin/django_projects/rollup_attendance.sh >/dev/null 2>&1
 ```
+
+It holds a `flock`, so a backfill run by hand and a scheduled run cannot write
+the same rows at once; the second one skips rather than queues. It logs to
+`django_projects/logs/attendance_rollup.log`, and because cron on that box mails
+nowhere, failures also go to the journal:
+
+```bash
+journalctl -t attendance-rollup -p err --since today
+```
+
+It never passes `--allow-stale`. If the plant box has not reported, the roll-up
+refuses and this script says so; that refusal is the system working, and the
+fix is on the Windows side, never here.
 
 ## How you find out it failed
 

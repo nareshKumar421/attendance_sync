@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Task Scheduler definition for the punch agent on the plant Windows box.
+
+  One task, two triggers: 12:45 and 23:15. The application server rolls the
+  punches up at 13:00 and 23:30, fifteen minutes after each. That order is
+  load-bearing: a roll-up that runs first writes ABSENT for everybody.
+
+  Import:
+    schtasks /Create /TN "Attendance Sync" /XML AttendanceSync.xml /RU ACCOUNT
+
+  Then edit the <Command> below to wherever the repo actually lives. It is the
+  only line that needs changing.
+-->
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>Copies punches from the punching machines into the factory database. Runs at 12:45 and 23:15; the application server rolls them up at 13:00 and 23:30.</Description>
+    <URI>\Attendance Sync</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-19T12:45:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+    <CalendarTrigger>
+      <StartBoundary>2026-09-19T23:15:00</StartBoundary>
+      <Enabled>true</Enabled>
+      <ScheduleByDay>
+        <DaysInterval>1</DaysInterval>
+      </ScheduleByDay>
+    </CalendarTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>S4U</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <!-- A run still going when the next fires means the LAN is crawling.
+         Starting a second one on top of it helps nothing; the window is two
+         days wide, so the next run re-covers whatever this one missed. -->
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <!-- The plant box gets rebooted and gets switched off. Without this, a
+         missed 23:15 is simply never made up and a day goes uncollected. -->
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT1H</ExecutionTimeLimit>
+    <Priority>7</Priority>
+    <!-- A dropped LAN link is the common failure and it is usually brief.
+         Three retries covers it without the retries outliving the roll-up. -->
+    <RestartOnFailure>
+      <Interval>PT5M</Interval>
+      <Count>3</Count>
+    </RestartOnFailure>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\attendance-sync\scheduling\run_attendance_sync.bat</Command>
+    </Exec>
+  </Actions>
+</Task>
