@@ -1,0 +1,9 @@
+# Two dependencies, deliberately. This runs on a Windows box that somebody else
+# has to keep working, and every extra install is a thing that can go missing.
+#
+# pymssql rather than pyodbc: it bundles FreeTDS in the wheel and needs no
+# unixODBC or msodbcsql driver installed on the host.
+pymssql==2.4.1
+
+# psycopg2-binary rather than psycopg2: no build toolchain needed on Windows.
+psycopg2-binary==2.9.10
