@@ -47,6 +47,12 @@ copy .env.example .env      # then fill it in
 python attendance_sync.py --check
 ```
 
+On the plant Windows box — which is the only place this is really installed —
+follow **[docs/WINDOWS_SERVER_SETUP.md](docs/WINDOWS_SERVER_SETUP.md)** instead.
+It covers the parts that are not a `pip install`: which Python build to use and
+why the Store one breaks under Task Scheduler, the account the task runs as, the
+firewall and `pg_hba.conf` lines, and a hand-over checklist.
+
 `--check` proves both ends work — SQL Server reachable, Postgres reachable, all
 three tables present with the columns this script writes, and writes actually
 permitted — without moving any data. Run it before scheduling anything. A
@@ -85,6 +91,16 @@ python attendance_sync.py --date-from 2026-09-01 --date-to 2026-09-17   # backfi
 
 `--days 2` is the default and the right nightly setting: a late punch-out lands
 after midnight, so a day is not final until the next one has started.
+
+```bash
+python attendance_sync.py --status     # the runs already on record. Reads only.
+python attendance_sync.py --days 1 --verbose   # watch one, with the log detail
+```
+
+`--status` answers "has this ever worked, and when did it stop?" from the box
+itself — which has no psql and often no browser, and is the box the answer is
+about. It prints the last runs, how many punches are stored, and whether the
+mirror is current or stale enough that the server roll-up is refusing.
 
 Safe to re-run over any range. Punches carry a uniqueness constraint on
 `(code, timestamp, device)`, so a repeated range inserts nothing.
@@ -126,8 +142,8 @@ schtasks /Create /TN "Attendance Sync (night)"  /TR "C:\path\to\sync\scheduling\
 The `.bat` sets its own working directory, so no "Start in" field to forget --
 which was worth removing, because without it the script finds no `.env`, fails
 on the first setting it reads, and looks identical to a night nobody punched.
-It logs to `logs\attendance_sync.log` and exits with the script's own code, so
-Task Scheduler's "Last Run Result" means something.
+It exits with the script's own code, so Task Scheduler's "Last Run Result" means
+something.
 
 **Application server.** `rollup_attendance.sh` lives at
 `/home/superadmin/django_projects/` and is in `superadmin`'s crontab:
@@ -153,15 +169,38 @@ fix is on the Windows side, never here.
 ## How you find out it failed
 
 Every run writes a row to `attendance_punchsyncrun` — success or failure, with
-the error text. Three places surface it:
+the error text. Four places surface it:
 
 - **Task Scheduler** shows a non-zero exit code. The script exits 1 on any failure.
+- **The logs on the box**, which are where the *reason* is. See
+  [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 - **The attendance page** shows an amber banner once the last successful run is
   older than `ATTENDANCE_SYNC_STALE_HOURS` (36 by default).
 - **`manage.py sync_biometric_attendance` refuses to run** on a stale mirror and
   exits non-zero. This is the important one: rolling up punches that never
   arrived does not throw an error, it quietly marks three hundred people absent,
   and payroll is run from the result.
+
+### The logs
+
+Two files under `logs/`, answering different questions. Both rotate and cap
+themselves, so neither needs pruning.
+
+| File | Written by | What it holds |
+|---|---|---|
+| `attendance_sync.log` | the script | What the run was pointed at, how long each step took, the traceback behind a failure. 2MB x 7 |
+| `task_wrapper.log` | `run_attendance_sync.bat` | That the task fired at all, and its exit code |
+
+The second exists for the one failure the first cannot record: Python never
+starting, because the venv moved or the interpreter is gone. Without it, an
+empty console and a green tick are indistinguishable.
+
+Every run also writes one `RESULT` line, so a `findstr RESULT` over that file is
+the agent's whole history on that box — which run pulled nothing, which night it
+stopped, when it started getting slow.
+
+Credentials are never written to either file. The rest of it is meant to be
+pasted into a ticket, which is why it is worth being careful about that.
 
 ## Four things about the source schema
 

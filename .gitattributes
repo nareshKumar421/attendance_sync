@@ -1,0 +1,16 @@
+# Line endings, which matter here more than usual: half of this repo is checked
+# out on a Windows box in the plant and half is copied to a Linux server.
+
+* text=auto
+
+# cmd.exe is the one interpreter that genuinely minds. A .bat with bare LFs can
+# mis-parse a parenthesised block or a `for` loop -- and it does it silently,
+# running some of the lines. Force CRLF whatever the clone's autocrlf says.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# And the mirror image: rollup_attendance.sh is checked out here and copied to
+# the application server. bash reads a trailing CR as part of the command and
+# fails with "$'\r': command not found", which reads as a corrupt file.
+*.sh text eol=lf

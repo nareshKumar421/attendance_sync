@@ -6,4 +6,7 @@
 pymssql==2.4.1
 
 # psycopg2-binary rather than psycopg2: no build toolchain needed on Windows.
-psycopg2-binary==2.9.10
+# 2.9.11 and not 2.9.10: 2.9.10's wheels stop at CPython 3.13, so on a box with
+# 3.14 pip falls back to building from source and fails for want of a compiler --
+# which is exactly the toolchain this line exists to avoid needing.
+psycopg2-binary==2.9.11

@@ -29,14 +29,27 @@ Safe to re-run over any range: punches carry a uniqueness constraint on
 Exits non-zero on any failure, so Task Scheduler shows a red result. A silent
 failure here is the expensive one -- nobody's punches arrive, and everybody
 reads as absent.
+
+Every run also writes ``logs/attendance_sync.log`` next to this file: what it
+was pointed at, how long each step took, and the full traceback on failure.
+Task Scheduler keeps an exit code and nothing else, and the console window is
+gone by the time anybody reads the result, so that file is usually the only
+account of what happened at 23:15.
+
+    python attendance_sync.py --status         # the last runs, read back out
 """
 
 from __future__ import annotations
 
 import argparse
+import getpass
+import logging
 import os
+import socket
 import sys
+import time
 from datetime import date, datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 
 # India has not observed daylight saving since 1945, so a fixed offset is exact
 # and stays exact. Deliberately not zoneinfo: that needs the IANA database,
@@ -61,6 +74,163 @@ CONTRACT = {
 
 class SyncFailed(RuntimeError):
     """Something went wrong that must not look like 'nobody punched today'."""
+
+
+# --------------------------------------------------------------------------
+# The maintenance log
+# --------------------------------------------------------------------------
+#
+# Everything the console prints goes to a file too, with a timestamp and the
+# detail the console leaves out: what this run was pointed at, how long each
+# step took, and the traceback behind a failure.
+#
+# This is not decoration. The run that matters is the one at 23:15 with nobody
+# logged in, and it is read the next morning over RDP. Task Scheduler keeps an
+# exit code; the console window is gone. Without a file, "it says failed" is
+# the entire evidence, and the three failures that look identical from there --
+# the LAN dropped, the credentials changed, the table was renamed -- each want
+# a different person.
+
+#: Next to this file, not %TEMP% or the working directory: whoever is debugging
+#: this has the repo open already, and a log they cannot find is no log.
+LOG_DIR_DEFAULT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs")
+LOG_NAME = "attendance_sync.log"
+LOG_BYTES = 2 * 1024 * 1024
+LOG_KEEP = 7
+
+log = logging.getLogger("attendance_sync")
+
+
+def _ist_clock(seconds):
+    """Log timestamps in plant time.
+
+    Every other clock in this system is IST -- the punches, the run rows, the
+    shift everybody works. A log in UTC or in whatever the box's locale happens
+    to be forces mental arithmetic at exactly the moment nobody has the patience
+    for it.
+    """
+    return datetime.fromtimestamp(seconds, IST).timetuple()
+
+
+class _AtMost(logging.Filter):
+    """Progress on stdout, trouble on stderr -- which is where they were."""
+
+    def __init__(self, level):
+        super().__init__()
+        self.level = level
+
+    def filter(self, record):
+        return record.levelno <= self.level
+
+
+def setup_logging(log_dir=LOG_DIR_DEFAULT, verbose=False):
+    """Console exactly as before, plus a rotating file with everything.
+
+    Returns the path being written, or ``None`` if no file could be opened.
+    """
+    log.setLevel(logging.DEBUG)
+    log.handlers.clear()
+    log.propagate = False
+
+    # No level prefix on the console: this output is read by people who are not
+    # looking for a log, and "INFO: Done." reads worse than "Done."
+    plain = logging.Formatter("%(message)s")
+
+    to_stdout = logging.StreamHandler(sys.stdout)
+    to_stdout.setLevel(logging.DEBUG if verbose else logging.INFO)
+    to_stdout.addFilter(_AtMost(logging.INFO))
+    to_stdout.setFormatter(plain)
+    log.addHandler(to_stdout)
+
+    to_stderr = logging.StreamHandler(sys.stderr)
+    to_stderr.setLevel(logging.WARNING)
+    to_stderr.setFormatter(plain)
+    log.addHandler(to_stderr)
+
+    # A Windows console is cp1252 by default, and a SQL Server error carrying a
+    # smart quote would raise UnicodeEncodeError while reporting the real
+    # failure -- losing it, and exiting on the wrong error.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+    if not log_dir:
+        return None
+
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, LOG_NAME)
+        # Rotating, because nobody prunes this box: twice a day for years still
+        # fits in 2MB x 7, and a full disk in the plant would stop the punches
+        # arriving -- the exact outcome this script exists to prevent.
+        to_file = RotatingFileHandler(
+            path, maxBytes=LOG_BYTES, backupCount=LOG_KEEP,
+            encoding="utf-8", errors="replace",
+        )
+        to_file.setLevel(logging.DEBUG)
+        file_format = logging.Formatter(
+            "%(asctime)s  %(levelname)-7s %(message)s", datefmt="%Y-%m-%d %H:%M:%S IST"
+        )
+        file_format.converter = _ist_clock
+        to_file.setFormatter(file_format)
+        log.addHandler(to_file)
+        return path
+    except OSError as exc:
+        # A log that cannot be opened is not a reason to skip the punches. Say
+        # so loudly and carry on -- the run still writes attendance_punchsyncrun,
+        # which is what the application actually reads.
+        log.warning(f"Could not open a log file in {log_dir}: {exc}")
+        log.warning("Continuing without one. Console output is the only record.")
+        return None
+
+
+def log_preamble(log_path, env_path):
+    """Who ran this, with what, against what. File only -- it is for later.
+
+    Nine failures in ten turn out to be "it was pointed at the wrong thing":
+    the archive table, a host that moved subnet, an account whose password was
+    rotated. None of that shows in the console output, and ``.env`` is edited
+    by hand on a box several people have access to.
+    """
+    log.debug("=" * 72)
+    log.debug("attendance_sync starting")
+    try:
+        who = getpass.getuser()
+    except Exception:  # pragma: no cover - some service accounts have no name
+        who = "unknown"
+    log.debug(f"  box      {socket.gethostname()} as {who} (pid {os.getpid()})")
+    log.debug(f"  python   {sys.version.split()[0]} at {sys.executable}")
+    log.debug(f"  cwd      {os.getcwd()}")
+    log.debug(f"  env file {os.path.abspath(env_path)}"
+              + ("" if os.path.exists(env_path) else "  <-- DOES NOT EXIST"))
+    log.debug(f"  log file {log_path or '(none -- console only)'}")
+    log.debug(f"  argv     {' '.join(sys.argv[1:]) or '(no arguments)'}")
+    # Masked deliberately: this file gets mailed around when something breaks.
+    log.debug("  punch machine  %s:%s db=%s table=%s user=%s" % (
+        os.environ.get("ATTENDANCE_DB_HOST", "(unset)"),
+        os.environ.get("ATTENDANCE_DB_PORT", "1433"),
+        os.environ.get("ATTENDANCE_DB_NAME", "(unset)"),
+        os.environ.get("ATTENDANCE_PUNCH_TABLE", PUNCH_TABLE_DEFAULT),
+        os.environ.get("ATTENDANCE_DB_USER", "(unset)"),
+    ))
+    log.debug("  factory db     %s:%s db=%s user=%s" % (
+        os.environ.get("PG_HOST", "(unset)"),
+        os.environ.get("PG_PORT", "5432"),
+        os.environ.get("PG_NAME", "(unset)"),
+        os.environ.get("PG_USER", "(unset)"),
+    ))
+    log.debug("  passwords are never written here")
+
+
+def log_result(**fields):
+    """One greppable line per run, whatever happened.
+
+    A ``findstr RESULT`` over the log file is then the whole history of the
+    agent on this box -- which run pulled nothing, which night it stopped.
+    """
+    log.debug("RESULT " + " ".join(f"{key}={value}" for key, value in fields.items()))
 
 
 # --------------------------------------------------------------------------
@@ -104,9 +274,11 @@ def mssql_connect():
         raise SyncFailed(
             "pymssql is not installed. Run: pip install -r requirements.txt"
         ) from exc
+    host = need("ATTENDANCE_DB_HOST")
+    started = time.monotonic()
     try:
-        return pymssql.connect(
-            server=need("ATTENDANCE_DB_HOST"),
+        connection = pymssql.connect(
+            server=host,
             port=str(os.environ.get("ATTENDANCE_DB_PORT", "1433")),
             user=need("ATTENDANCE_DB_USER"),
             password=need("ATTENDANCE_DB_PASSWORD"),
@@ -117,7 +289,15 @@ def mssql_connect():
     except SyncFailed:
         raise
     except Exception as exc:
+        # Logged as well as raised: the caller turns this into one sentence on
+        # stderr, and the driver's own wording underneath it is what tells you
+        # whether the box refused the login or never answered at all.
+        log.debug(f"pymssql.connect to {host} failed after "
+                  f"{time.monotonic() - started:.1f}s")
         raise SyncFailed(f"Could not reach the punch database: {exc}") from exc
+    log.debug(f"connected to the punch machines at {host} "
+              f"in {time.monotonic() - started:.1f}s")
+    return connection
 
 
 def punch_table():
@@ -153,9 +333,14 @@ def read_aliases(connection):
                 "WHERE id IS NOT NULL AND empcode IS NOT NULL"
             )
             rows = cursor.fetchall()
-    except Exception:
+    except Exception as exc:
+        # Returning [] is deliberate (see above), but the reason must not be
+        # thrown away with it: "read as empty" has to be separable from "the
+        # table is gone" and from "this login cannot see it".
+        log.debug(f"factory_codes could not be read: {exc}", exc_info=True)
         return []
 
+    log.debug(f"factory_codes returned {len(rows)} row(s)")
     pairs = []
     for real, alias in rows:
         real = (real or "").strip().upper()
@@ -174,6 +359,7 @@ def read_punches(connection, date_from: date, date_to: date):
     get it wrong.
     """
     table = punch_table()
+    started = time.monotonic()
     try:
         with connection.cursor() as cursor:
             cursor.execute(
@@ -188,8 +374,15 @@ def read_punches(connection, date_from: date, date_to: date):
             )
             rows = cursor.fetchall()
     except Exception as exc:
+        log.debug(f"SELECT from {table} failed after "
+                  f"{time.monotonic() - started:.1f}s")
         raise SyncFailed(f"Reading punches failed: {exc}") from exc
 
+    # Worth having both numbers: rows that came back versus punches kept. A gap
+    # between them means codes or timestamps are arriving null, which is a
+    # machine problem and not visible anywhere else.
+    log.debug(f"{table} returned {len(rows)} row(s) for {date_from}..{date_to} "
+              f"in {time.monotonic() - started:.1f}s")
     punches = []
     for paycode, punched_at, device in rows:
         code = (paycode or "").strip().upper()
@@ -200,6 +393,8 @@ def read_punches(connection, date_from: date, date_to: date):
         # left naive it would be read as UTC and every punch would shift by 5h30,
         # putting the early shift on the previous day.
         punches.append((code, punched_at.replace(tzinfo=IST), (device or "").strip()))
+    if len(punches) != len(rows):
+        log.debug(f"{len(rows) - len(punches)} row(s) skipped: no code or no timestamp")
     return punches
 
 
@@ -215,20 +410,29 @@ def pg_connect():
         raise SyncFailed(
             "psycopg2 is not installed. Run: pip install -r requirements.txt"
         ) from exc
+    host = need("PG_HOST")
+    started = time.monotonic()
     try:
-        return psycopg2.connect(
+        connection = psycopg2.connect(
             dbname=need("PG_NAME"),
             user=need("PG_USER"),
             password=need("PG_PASSWORD"),
-            host=need("PG_HOST"),
+            host=host,
             port=os.environ.get("PG_PORT", "5432"),
             connect_timeout=15,
+            # Names this agent in pg_stat_activity, so a connection from the
+            # plant box is identifiable from the server side without guessing.
             application_name="attendance_sync",
         )
     except SyncFailed:
         raise
     except Exception as exc:
+        log.debug(f"psycopg2.connect to {host} failed after "
+                  f"{time.monotonic() - started:.1f}s")
         raise SyncFailed(f"Could not reach the factory database: {exc}") from exc
+    log.debug(f"connected to the factory database at {host} "
+              f"in {time.monotonic() - started:.1f}s")
+    return connection
 
 
 def check_contract(pg):
@@ -248,11 +452,14 @@ def check_contract(pg):
                 if column not in present:
                     missing.append(f"{table}.{column} does not exist")
     if missing:
+        for problem in missing:
+            log.debug(f"contract broken: {problem}")
         raise SyncFailed(
             "The factory database does not match what this script writes:\n  "
             + "\n  ".join(missing)
             + "\nThe Django side has probably moved; do not force it."
         )
+    log.debug(f"contract ok: {', '.join(CONTRACT)}")
 
 
 def write_aliases(pg, pairs):
@@ -279,6 +486,7 @@ def write_aliases(pg, pairs):
             "DELETE FROM attendance_punchalias WHERE alias_code <> ALL(%s)",
             ([alias for alias, _ in pairs],),
         )
+        log.debug(f"{cursor.rowcount} alias(es) deleted as no longer upstream")
         cursor.execute("SELECT count(*) FROM attendance_punchalias")
         return cursor.fetchone()[0]
 
@@ -291,9 +499,12 @@ def write_punches(pg, punches):
 
     now = datetime.now(IST)
     inserted = 0
+    started = time.monotonic()
     with pg.cursor() as cursor:
         for start in range(0, len(punches), 5000):
             page = punches[start : start + 5000]
+            log.debug(f"inserting punches {start + 1}..{start + len(page)} "
+                      f"of {len(punches)}")
             returned = execute_values(
                 cursor,
                 "INSERT INTO attendance_punchevent "
@@ -303,6 +514,10 @@ def write_punches(pg, punches):
                 fetch=True,
             )
             inserted += len(returned)
+    # inserted < pulled is the normal, healthy case on a re-run: the window is
+    # two days wide and yesterday's punches are already held.
+    log.debug(f"{inserted} of {len(punches)} punch(es) were new "
+              f"({time.monotonic() - started:.1f}s)")
     return inserted
 
 
@@ -321,6 +536,7 @@ def write_run(pg, *, started, date_from, date_to, pulled, inserted, latest, ok, 
             (started, datetime.now(IST), date_from, date_to, pulled, inserted,
              latest, ok, detail[:2000]),
         )
+    log.debug(f"attendance_punchsyncrun row written: ok={ok}, {detail[:200]}")
 
 
 # --------------------------------------------------------------------------
@@ -329,24 +545,32 @@ def write_run(pg, *, started, date_from, date_to, pulled, inserted, latest, ok, 
 
 
 def run_check():
-    print("Checking the punch machines ...")
+    log.info("Checking the punch machines ...")
     mssql = mssql_connect()
     try:
         with mssql.cursor() as cursor:
             cursor.execute(f"SELECT COUNT(*), MAX(CombinedDatetime) FROM {punch_table()}")
             count, latest = cursor.fetchone()
-        print(f"  ok: {punch_table()} holds {count} punches, newest {latest}")
+        log.info(f"  ok: {punch_table()} holds {count} punches, newest {latest}")
+        # A live table is one being written to now. An archive answers this
+        # query perfectly well and stopped taking punches in 2025.
+        if latest is not None and (datetime.now(IST).date() - latest.date()).days > 2:
+            log.warning(f"  warning: the newest punch in {punch_table()} is "
+                        f"{latest}. Either the plant is shut, or this is an "
+                        f"archive table and ATTENDANCE_PUNCH_TABLE is wrong.")
         aliases = read_aliases(mssql)
-        print(f"  ok: factory_codes maps {len(aliases)} alias(es)"
-              if aliases else "  warning: factory_codes read as empty")
+        if aliases:
+            log.info(f"  ok: factory_codes maps {len(aliases)} alias(es)")
+        else:
+            log.warning("  warning: factory_codes read as empty")
     finally:
         mssql.close()
 
-    print("Checking the factory database ...")
+    log.info("Checking the factory database ...")
     pg = pg_connect()
     try:
         check_contract(pg)
-        print("  ok: all three tables present with the expected columns")
+        log.info("  ok: all three tables present with the expected columns")
         # Prove the write actually works now, rather than at 01:30. Rolled back,
         # so nothing is left behind.
         with pg.cursor() as cursor:
@@ -356,16 +580,82 @@ def run_check():
                 (datetime.now(IST),),
             )
         pg.rollback()
-        print("  ok: writes are permitted")
+        log.info("  ok: writes are permitted")
     finally:
         pg.close()
 
-    print("\nBoth ends are reachable. Run with --dry-run next.")
+    log.info("\nBoth ends are reachable. Run with --dry-run next.")
+
+
+def run_status(limit=10):
+    """The agent's own history, read back out of the factory database.
+
+    This box has no psql and often no browser, so without this there is no way
+    to answer "has this ever worked, and when did it stop?" from the machine
+    you are standing at -- which is the machine the answer is about.
+
+    Reads only. Safe to run while a sync is in progress.
+    """
+    pg = pg_connect()
+    try:
+        with pg.cursor() as cursor:
+            cursor.execute(
+                "SELECT started_at, date_from, date_to, rows_pulled, rows_inserted, "
+                "ok, detail FROM attendance_punchsyncrun "
+                "ORDER BY started_at DESC LIMIT %s",
+                (limit,),
+            )
+            runs = cursor.fetchall()
+            cursor.execute(
+                "SELECT count(*), max(punched_at) FROM attendance_punchevent"
+            )
+            stored, newest = cursor.fetchone()
+            cursor.execute(
+                "SELECT max(started_at) FROM attendance_punchsyncrun WHERE ok"
+            )
+            last_good = cursor.fetchone()[0]
+    finally:
+        pg.close()
+
+    if not runs:
+        log.warning("No runs recorded at all -- this agent has never written here.")
+        log.warning("Check PG_NAME: an empty history usually means the right")
+        log.warning("credentials against the wrong database.")
+        return 0
+
+    log.info(f"Last {len(runs)} run(s), newest first:")
+    for started, d_from, d_to, pulled, inserted, ok, detail in runs:
+        # First line only: a failure detail carries the driver's whole multi-line
+        # complaint, and this is a table. `detail` is blank on some rows, so the
+        # empty case has to survive rather than take the diagnosis down with it.
+        first_line = next(iter((detail or "").splitlines()), "")
+        log.info(f"  {started.astimezone(IST):%Y-%m-%d %H:%M}  "
+                 f"{'ok    ' if ok else 'FAILED'}  {d_from}..{d_to}  "
+                 f"pulled={pulled} new={inserted}  {first_line[:70]}")
+
+    log.info(f"\n{stored} punch(es) stored, newest {newest.astimezone(IST) if newest else 'none'}")
+
+    # The number that decides whether the roll-up will run at all. The server
+    # refuses on a stale mirror rather than marking the workforce absent, so
+    # this is the first thing to look at when the register stops updating.
+    if last_good is None:
+        log.warning("No successful run on record. The roll-up will refuse.")
+    else:
+        age = (datetime.now(IST) - last_good.astimezone(IST)).total_seconds() / 3600
+        line = f"Last successful run {age:.1f} hour(s) ago."
+        if age > 36:
+            log.warning(line + " Past ATTENDANCE_SYNC_STALE_HOURS (36 by")
+            log.warning("default), so the server roll-up is refusing to run and the")
+            log.warning("attendance page is showing its amber banner.")
+        else:
+            log.info(line + " The mirror is current.")
+    return 0
 
 
 def run_sync(date_from: date, date_to: date, dry_run: bool):
     started = datetime.now(IST)
-    print(f"Reading punches {date_from} .. {date_to}")
+    clock = time.monotonic()
+    log.info(f"Reading punches {date_from} .. {date_to}")
 
     mssql = mssql_connect()
     try:
@@ -375,10 +665,20 @@ def run_sync(date_from: date, date_to: date, dry_run: bool):
         mssql.close()
 
     latest = max((at for _, at, _ in punches), default=None)
-    print(f"  {len(punches)} punch(es), {len(aliases)} alias(es), newest {latest}")
+    log.info(f"  {len(punches)} punch(es), {len(aliases)} alias(es), newest {latest}")
+
+    # Not an error -- a shut plant looks like this too -- but it is the shape of
+    # every silent failure this project exists around, so it is never implicit.
+    if not punches:
+        log.warning(f"  warning: no punches at all between {date_from} and "
+                    f"{date_to}. If the plant was working, check "
+                    f"ATTENDANCE_PUNCH_TABLE and the machines themselves.")
 
     if dry_run:
-        print("Dry run: nothing written.")
+        log.info("Dry run: nothing written.")
+        log_result(ok="dry-run", window=f"{date_from}..{date_to}",
+                   pulled=len(punches), aliases=len(aliases),
+                   elapsed=f"{time.monotonic() - clock:.1f}s")
         return 0
 
     pg = pg_connect()
@@ -392,10 +692,14 @@ def run_sync(date_from: date, date_to: date, dry_run: bool):
             pg.rollback()
             # The run row is the only way the application learns this failed, so
             # it is written on its own connection state, outside the rollback.
+            log.debug("the write transaction was rolled back")
             write_run(pg, started=started, date_from=date_from, date_to=date_to,
                       pulled=len(punches), inserted=0, latest=latest, ok=False,
                       detail=f"Writing to the factory database failed: {exc}")
             pg.commit()
+            log_result(ok=0, window=f"{date_from}..{date_to}", pulled=len(punches),
+                       inserted=0, elapsed=f"{time.monotonic() - clock:.1f}s",
+                       detail=repr(str(exc)[:200]))
             raise SyncFailed(f"Writing to the factory database failed: {exc}") from exc
 
         detail = (f"{len(punches)} pulled, {inserted} new"
@@ -408,9 +712,13 @@ def run_sync(date_from: date, date_to: date, dry_run: bool):
     finally:
         pg.close()
 
-    print(f"  {inserted} new punch(es) stored"
-          + (f", alias table now {alias_rows} row(s)" if alias_rows is not None else ""))
-    print("Done. The app server rolls these up into the attendance sheet.")
+    log.info(f"  {inserted} new punch(es) stored"
+             + (f", alias table now {alias_rows} row(s)" if alias_rows is not None else ""))
+    log.info("Done. The app server rolls these up into the attendance sheet.")
+    log_result(ok=1, window=f"{date_from}..{date_to}", pulled=len(punches),
+               inserted=inserted, aliases=alias_rows,
+               latest=latest.isoformat() if latest else None,
+               elapsed=f"{time.monotonic() - clock:.1f}s")
     return 0
 
 
@@ -427,17 +735,32 @@ def main(argv=None):
     )
     parser.add_argument("--check", action="store_true",
                         help="Prove both ends work and stop. Moves no data.")
+    parser.add_argument("--status", action="store_true",
+                        help="Show the runs already recorded and stop. Reads only.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Read and report, write nothing.")
     parser.add_argument("--env", default=".env", help="Path to the settings file.")
+    parser.add_argument("--log-dir", default=LOG_DIR_DEFAULT,
+                        help="Where attendance_sync.log is written. Empty to write none.")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Put the log's detail on the console too. The file "
+                             "always has it, so this is for watching a run live.")
     args = parser.parse_args(argv)
 
+    # Before anything that can fail, so that whatever happens next is recorded.
+    log_path = setup_logging(args.log_dir, args.verbose)
     load_env(args.env)
+    log_preamble(log_path, args.env)
 
     try:
         if args.check:
             run_check()
+            if log_path:
+                log.info(f"Log: {log_path}")
             return 0
+
+        if args.status:
+            return run_status()
 
         today = datetime.now(IST).date()
         date_to = (datetime.strptime(args.date_to, "%Y-%m-%d").date()
@@ -449,12 +772,30 @@ def main(argv=None):
         return run_sync(date_from, date_to, args.dry_run)
     except SyncFailed as exc:
         # The sentence, not the frames: whoever reads this at 08:00 needs to know
-        # which end was down, and a traceback buries that.
-        print(f"FAILED: {exc}", file=sys.stderr)
+        # which end was down, and a traceback buries that. The frames go to the
+        # log file, where they are there for the case the sentence is not enough.
+        log.error(f"FAILED: {exc}")
+        log.debug("the failure above, in full:", exc_info=True)
+        log_result(ok=0, detail=repr(str(exc).splitlines()[0][:200]))
+        if log_path:
+            log.error(f"Details: {log_path}")
         return 1
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
+        log.error("Interrupted.")
+        log_result(ok=0, detail="interrupted by hand")
         return 130
+    except Exception as exc:  # pragma: no cover - the unanticipated one
+        # A crash that is not a SyncFailed is a bug here rather than a problem
+        # out there, and it is the one failure with no written account at all:
+        # the traceback goes to a console that closed hours ago. Catch it, file
+        # it, and still exit non-zero so the roll-up refuses rather than marking
+        # the workforce absent.
+        log.error(f"FAILED, unexpectedly: {exc.__class__.__name__}: {exc}")
+        log.debug("the crash above, in full:", exc_info=True)
+        log_result(ok=0, detail=repr(f"{exc.__class__.__name__}: {exc}"[:200]))
+        if log_path:
+            log.error(f"Traceback: {log_path}")
+        return 1
 
 
 if __name__ == "__main__":
